@@ -18,8 +18,7 @@ use it.
 
 from Handler import Handler
 import socket
-import time
-
+import ssl
 
 class GraphiteHandler(Handler):
     """
@@ -35,13 +34,17 @@ class GraphiteHandler(Handler):
 
         # Initialize Data
         self.socket = None
+        # SSL SOCKET
+        self.sslSocket = None
 
         # Initialize Options
         self.proto = self.config['proto'].lower().strip()
         self.host = self.config['host']
         self.port = int(self.config['port'])
-        self.timeout = float(self.config['timeout'])
+        self.timeout = int(self.config['timeout'])
         self.keepalive = bool(self.config['keepalive'])
+        self.ssl = bool(int(self.config['ssl']))
+        self.ssl_ciphers = self.config['ssl_ciphers']
         self.keepaliveinterval = int(self.config['keepaliveinterval'])
         self.batch_size = int(self.config['batch'])
         self.max_backlog_multiplier = int(
@@ -51,8 +54,6 @@ class GraphiteHandler(Handler):
         self.flow_info = self.config['flow_info']
         self.scope_id = self.config['scope_id']
         self.metrics = []
-        self.reconnect_interval = int(self.config['reconnect_interval'])
-        self.last_connect_timestamp = -1
 
         # Connect
         self._connect()
@@ -68,6 +69,8 @@ class GraphiteHandler(Handler):
             'port': 'Port',
             'proto': 'udp, udp4, udp6, tcp, tcp4, or tcp6',
             'timeout': '',
+            'ssl': 'Enable SSL',
+            'ssl_ciphers': 'ECDHE-RSA-AES256-GCM-SHA384',
             'batch': 'How many to store before sending to the graphite server',
             'max_backlog_multiplier': 'how many batches to store before trimming',  # NOQA
             'trim_backlog_multiplier': 'Trim down how many batches',
@@ -75,8 +78,6 @@ class GraphiteHandler(Handler):
             'keepaliveinterval': 'How frequently to send keepalives',
             'flow_info': 'IPv6 Flow Info',
             'scope_id': 'IPv6 Scope ID',
-            'reconnect_interval': 'How often (seconds) to reconnect to '
-                                  'graphite. Default (0) is never',
         })
 
         return config
@@ -93,13 +94,14 @@ class GraphiteHandler(Handler):
             'proto': 'tcp',
             'timeout': 15,
             'batch': 1,
+            'ssl': 0,
+            'ssl_ciphers': 'ECDHE-RSA-AES256-GCM-SHA384',
             'max_backlog_multiplier': 5,
             'trim_backlog_multiplier': 4,
             'keepalive': 0,
             'keepaliveinterval': 10,
             'flow_info': 0,
             'scope_id': 0,
-            'reconnect_interval': 0,
         })
 
         return config
@@ -128,7 +130,10 @@ class GraphiteHandler(Handler):
         Try to send all data in buffer.
         """
         try:
-            self.socket.sendall(data)
+            if self.ssl:
+                self.sslSocket.sendall(data)
+            else:
+                self.socket.sendall(data) 
             self._reset_errors()
         except:
             self._close()
@@ -136,17 +141,13 @@ class GraphiteHandler(Handler):
                                  "trying reconnect.")
             self._connect()
             try:
-                self.socket.sendall(data)
+                if self.ssl:
+                    self.sslSocket.sendall(data)
+                else:
+                    self.socket.sendall(data)
             except:
                 return
             self._reset_errors()
-
-    def _time_to_reconnect(self):
-        if self.reconnect_interval > 0:
-            if time.time() > (
-                    self.last_connect_timestamp + self.reconnect_interval):
-                return True
-        return False
 
     def _send(self):
         """
@@ -165,8 +166,6 @@ class GraphiteHandler(Handler):
                     # Send data to socket
                     self._send_data(''.join(self.metrics))
                     self.metrics = []
-                    if self._time_to_reconnect():
-                        self._close()
             except Exception:
                 self._close()
                 self._throttle_error("GraphiteHandler: Error sending metrics.")
@@ -174,10 +173,10 @@ class GraphiteHandler(Handler):
         finally:
             if len(self.metrics) >= (
                     self.batch_size * self.max_backlog_multiplier):
-                trim_offset = (self.batch_size *
-                               self.trim_backlog_multiplier * -1)
-                self.log.warn('GraphiteHandler: Trimming backlog. Removing' +
-                              ' oldest %d and keeping newest %d metrics',
+                trim_offset = (self.batch_size
+                               * self.trim_backlog_multiplier * -1)
+                self.log.warn('GraphiteHandler: Trimming backlog. Removing'
+                              + ' oldest %d and keeping newest %d metrics',
                               len(self.metrics) - abs(trim_offset),
                               abs(trim_offset))
                 self.metrics = self.metrics[trim_offset:]
@@ -236,12 +235,16 @@ class GraphiteHandler(Handler):
         self.socket.settimeout(self.timeout)
         # Connect to graphite server
         try:
-            self.socket.connect(connection_struct)
+            if self.ssl:
+                #WRAP SOCKET
+                self.sslSocket = ssl.wrap_socket(self.socket, ciphers=self.ssl_ciphers)
+                self.sslSocket.connect(connection_struct)
+            else:
+                self.socket.connect(connection_struct)
             # Log
             self.log.debug("GraphiteHandler: Established connection to "
                            "graphite server %s:%d.",
                            self.host, self.port)
-            self.last_connect_timestamp = time.time()
         except Exception, ex:
             # Log Error
             self._throttle_error("GraphiteHandler: Failed to connect to "
@@ -254,6 +257,10 @@ class GraphiteHandler(Handler):
         """
         Close the socket
         """
+        if self.sslSocket is not None:
+            self.sslSocket.close()
+        self.sslSocket = None 
+
         if self.socket is not None:
             self.socket.close()
         self.socket = None
